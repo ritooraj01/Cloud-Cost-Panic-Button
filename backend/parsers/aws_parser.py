@@ -119,6 +119,7 @@ def _friendly_region(region_code):
     """Translate AWS region codes to human-readable names."""
     mapping = {
         "ap-south-1":     "Asia Pacific (Mumbai)",
+        "ap-south-2":     "Asia Pacific (Hyderabad)",
         "ap-southeast-1": "Asia Pacific (Singapore)",
         "ap-southeast-2": "Asia Pacific (Sydney)",
         "ap-northeast-1": "Asia Pacific (Tokyo)",
