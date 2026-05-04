@@ -179,8 +179,45 @@ def _build_service_suggestions(records: list, currency: str = "USD") -> list:
     return suggestions
 
 
+def _build_usage_type_suggestions(usage_breakdown: dict, currency: str = "USD") -> list:
+    """
+    Generate precise suggestions from usage_breakdown_analyzer output.
+    These are higher quality than the generic service tips because they
+    are based on actual usage type patterns.
+    """
+    if not usage_breakdown or not usage_breakdown.get("available"):
+        return []
+
+    scale = 83.0 if currency == "USD" else 1.0
+    suggestions = []
+
+    for item in usage_breakdown.get("waste_items", []):
+        avoidable_usd = item["cost_usd"] * item["avoidable_pct"]
+        savings_inr = round(avoidable_usd * scale, 0)
+        if savings_inr < 500:
+            continue
+
+        copyable = (
+            f"Action: {item['action']} — potential savings up to "
+            f"₹{savings_inr:,.0f}/month ({item['confidence'].title()} confidence)"
+        )
+        suggestions.append({
+            "action": item["action"],
+            "detail": item["description"],
+            "savings_inr": savings_inr,
+            "confidence": item["confidence"],
+            "signal_type": item["type"],
+            "copyable_text": copyable,
+        })
+
+    # Sort by savings descending
+    suggestions.sort(key=lambda s: s["savings_inr"], reverse=True)
+    return suggestions
+
+
 def build(waste_signals: list[dict], spike_data: dict, total_cost: float,
-          records: list = None, currency: str = "USD") -> list[dict]:
+          records: list = None, currency: str = "USD",
+          usage_breakdown: dict = None) -> list[dict]:
     """
     Returns a list of suggestion dicts:
       {
@@ -296,6 +333,12 @@ def build(waste_signals: list[dict], spike_data: dict, total_cost: float,
 
     # Sort by savings descending
     suggestions.sort(key=lambda s: s["savings_inr"], reverse=True)
+
+    # ---- Priority 1: Usage-type-based suggestions (most accurate) --------
+    if not suggestions and usage_breakdown:
+        usage_sugg = _build_usage_type_suggestions(usage_breakdown, currency)
+        if usage_sugg:
+            return usage_sugg
 
     # ---- Fallback: service-based tips when no waste/spike signals available
     if not suggestions and records:

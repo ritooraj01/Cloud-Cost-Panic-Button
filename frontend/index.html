@@ -76,6 +76,15 @@
           </div>
         </div>
         <p id="s-narrative" class="summary-narrative"></p>
+        <!-- Top waste category banner — shown only when usage_type data available -->
+        <div id="s-top-waste" class="top-waste-banner hidden"></div>
+      </section>
+
+      <!-- ① b  COST CATEGORIES BREAKDOWN (usage-type data only) -->
+      <section class="card categories-card hidden" id="categories-section">
+        <h2>📂 Cost Categories Breakdown</h2>
+        <p class="section-hint">Detailed breakdown of what's actually inside each line item.</p>
+        <div id="categories-content"></div>
       </section>
 
       <!-- ② TOP 3 COST DRIVERS (HERO) -->
@@ -124,9 +133,10 @@
         </div>
       </section>
 
-      <!-- Reset -->
+      <!-- Reset + Download -->
       <div class="reset-row">
         <button class="btn btn-outline" id="reset-btn">⬆️ Upload Another CSV</button>
+        <button class="btn btn-outline" id="download-btn" style="display:none">📥 Download Report</button>
       </div>
 
     </section><!-- /results-section -->

@@ -5,6 +5,7 @@ The FastAPI endpoint calls only this; keeps routing layer thin.
 """
 
 from backend.analyzers import breakdown_analyzer, spike_detector, cost_drivers, waste_detector
+from backend.analyzers import usage_breakdown_analyzer
 from backend.utils import translator, suggestions
 
 
@@ -23,6 +24,7 @@ def generate(parsed: dict) -> dict:
     spike = spike_detector.detect(records, days_count)
     drivers = cost_drivers.find(records, days_count)
     waste = waste_detector.detect(records, days_count)
+    usage_breakdown = usage_breakdown_analyzer.analyze(records)
 
     total_cost = breakdown["total_cost"]
     period = breakdown["period_comparison"]
@@ -42,10 +44,18 @@ def generate(parsed: dict) -> dict:
         w["human_text"] = translator.translate_waste_signal(w, total_cost, currency)
 
     # ---- Build suggestions ----------------------------------------------
-    sugg = suggestions.build(waste, spike, total_cost, records=records, currency=currency)
+    sugg = suggestions.build(
+        waste, spike, total_cost,
+        records=records, currency=currency,
+        usage_breakdown=usage_breakdown,
+    )
 
     # ---- Compute total potential savings --------------------------------
     total_savings = sum(s["savings_inr"] for s in sugg)
+    # If usage_breakdown has avoidable cost estimate, use whichever is higher
+    if usage_breakdown.get("available") and usage_breakdown.get("total_avoidable_usd", 0) > 0:
+        ubd_savings_inr = round(usage_breakdown["total_avoidable_usd"] * (83.0 if currency == "USD" else 1.0), 0)
+        total_savings = max(total_savings, ubd_savings_inr)
 
     # ---- Compose final payload ------------------------------------------
     return {
@@ -91,6 +101,9 @@ def generate(parsed: dict) -> dict:
             "daily_trend": breakdown["daily_trend"],
             "region_breakdown": breakdown["region_breakdown"],
         },
+
+        # Usage-type detailed breakdown (available when usage_type CSV is uploaded)
+        "usage_breakdown": usage_breakdown,
 
         # Metadata
         "meta": {

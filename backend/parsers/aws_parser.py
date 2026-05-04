@@ -1,18 +1,18 @@
 ﻿"""
 AWS Cost & Usage CSV Parser
-Supports TWO formats automatically:
-  1. AWS Cost & Usage Report (CUR) - official export from AWS Billing console
+Supports THREE billing CSV formats automatically:
+  1. AWS Cost & Usage Report (CUR) — official export from AWS Billing console
      Detected by: lineItem/UnblendedCost column present
-     Key columns: lineItem/UsageStartDate, lineItem/UnblendedCost,
-                  product/ProductName, product/region, lineItem/UsageType
-  2. Simplified billing CSV - manual exports, sample files, third-party tools
-     Key columns: Date/date, Cost/cost, Service/service, Region/region
+  2. Service-wide billing CSV — "Service" first column, service names as remaining cols
+     e.g. downloaded from Cost Explorer grouped by Service, monthly granularity
+  3. Usage-type wide billing CSV — "Usage type" first column, usage type codes as cols
+     e.g. downloaded from Cost Explorer grouped by Usage Type, daily/monthly granularity
 
-Both formats are normalised to the same internal schema, then continue
-through the same analysis pipeline unchanged.
+All formats are normalised to the same internal schema (date, service, usage_type, cost, region).
 """
 
 import io
+import re
 import pandas as pd
 from typing import Optional
 
@@ -47,6 +47,148 @@ def _pick_column(df, aliases):
         if alias in df.columns:
             return alias
     return None
+
+
+# ---------------------------------------------------------------------------
+# Usage-type → service category mapping
+# Priority: first matching rule wins (order matters)
+# ---------------------------------------------------------------------------
+_USAGE_TYPE_RULES = [
+    # EC2 Compute
+    ("BoxUsage:",               "EC2 Compute",    "compute"),
+    ("EBSOptimized:",           "EC2 Compute",    "ebs_optimized_surcharge"),
+    ("StoppedInstance",         "EC2 Compute",    "stopped_instance"),
+    ("CPUCredits:",             "EC2 Compute",    "cpu_credits"),
+    ("ECS-EC2",                 "EC2 Compute",    "ecs_ec2"),
+    # EBS
+    ("EBS:VolumeUsage",         "EBS Storage",    "ebs_volume"),
+    ("EBS:VolumeP-IOPS",        "EBS Storage",    "ebs_iops"),
+    ("EBS:VolumeP-Throughput",  "EBS Storage",    "ebs_throughput"),
+    ("EBS:SnapshotUsage",       "EBS Snapshots",  "ebs_snapshot"),
+    ("EBS:",                    "EBS Storage",    "ebs_other"),
+    # NAT Gateway (before generic DataTransfer)
+    ("NatGateway-Bytes",        "NAT Gateway",    "nat_data"),
+    ("NatGateway-Hours",        "NAT Gateway",    "nat_hours"),
+    ("NatGateway",              "NAT Gateway",    "nat_other"),
+    # Data Transfer
+    ("DataTransfer-Regional",   "Data Transfer",  "regional"),
+    ("DataTransfer-Out",        "Data Transfer",  "egress"),
+    ("DataTransfer-AZ",         "Data Transfer",  "inter_az"),
+    ("DataTransfer-xAZ",        "Data Transfer",  "cross_az"),
+    ("DataTransfer-In",         "Data Transfer",  "ingress"),
+    ("DataTransfer",            "Data Transfer",  "other"),
+    ("S3-Egress",               "Data Transfer",  "s3_egress"),
+    ("AWS-Out-Bytes",           "Data Transfer",  "cross_region_egress"),
+    ("AWS-In-Bytes",            "Data Transfer",  "cross_region_ingress"),
+    ("DataProcessing-Bytes",    "Data Transfer",  "data_processing"),
+    ("CloudFront-Out-Bytes",    "Data Transfer",  "cf_egress"),
+    # Load Balancer
+    ("LoadBalancerUsage",       "Load Balancer",  "hours"),
+    ("LCUUsage",                "Load Balancer",  "lcu"),
+    # CloudWatch
+    ("CW:MetricMonitor",        "CloudWatch",     "metrics"),
+    ("CW:AlarmMonitor",         "CloudWatch",     "alarms"),
+    ("CW:Requests",             "CloudWatch",     "requests"),
+    ("MonitoredEC2",            "CloudWatch",     "ec2_monitoring"),
+    ("LogsAnalyzedBytes",       "CloudWatch",     "logs"),
+    ("Application-Signals",     "CloudWatch",     "app_signals"),
+    ("EventsAnalyzed",          "CloudWatch",     "events"),
+    ("VendedLog",               "CloudWatch",     "vended_logs"),
+    # ElastiCache
+    ("NodeUsage:cache",         "ElastiCache",    "cache_node"),
+    ("CachedData:",             "ElastiCache",    "cache_data"),
+    ("ElastiCacheProcessing",   "ElastiCache",    "processing"),
+    # Redshift
+    ("Node:ra3",                "Redshift",       "node"),
+    ("RMS:ra3",                 "Redshift",       "managed_storage"),
+    # OpenSearch
+    ("ESInstance:",             "OpenSearch",     "instance"),
+    ("ES:GP3-Storage",          "OpenSearch",     "storage"),
+    # S3
+    ("TimedStorage-ByteHrs",    "S3",             "standard_storage"),
+    ("TimedStorage-Z-ByteHrs",  "S3",             "ia_storage"),
+    ("IATimedStorage",          "S3",             "ia_storage"),
+    ("IA-TimedStorage",         "S3",             "ia_storage"),
+    ("TimedPITRStorage",        "S3",             "pitr"),
+    ("RequestV2-Tier0",         "S3",             "put_requests"),
+    ("Requests-INT-Tier",       "S3",             "int_requests"),
+    ("Requests-RBP",            "S3",             "rbp"),
+    ("Inventory-Objects",       "S3",             "inventory"),
+    ("Requests-Tier",           "S3",             "requests"),
+    # DynamoDB
+    ("WriteRequestUnits",       "DynamoDB",       "write"),
+    ("ReadRequestUnits",        "DynamoDB",       "read"),
+    ("ReadCapacityUnit",        "DynamoDB",       "rcu"),
+    ("WriteCapacityUnit",       "DynamoDB",       "wcu"),
+    ("Tables-Requests",         "DynamoDB",       "table_requests"),
+    # VPC / Networking
+    ("PublicIPv4:InUseAddress", "VPC",            "public_ip_inuse"),
+    ("PublicIPv4:IdleAddress",  "VPC",            "public_ip_idle"),
+    ("VpcEndpoint-Hours",       "VPC",            "endpoint_hours"),
+    ("VpcEndpoint-Bytes",       "VPC",            "endpoint_bytes"),
+    ("VpcPeering",              "VPC",            "peering"),
+    ("ClientVPN",               "VPC",            "vpn"),
+    ("VPN-Usage",               "VPC",            "vpn"),
+    # WAF
+    ("WebACLV2",                "WAF",            "webacl"),
+    ("RuleV2",                  "WAF",            "rules"),
+    # API Gateway
+    ("ApiGatewayRequest",       "API Gateway",    "requests"),
+    ("Gateway:Consumption",     "API Gateway",    "http_requests"),
+    # KMS
+    ("KMS-Requests",            "KMS",            "requests"),
+    ("KMS-Keys",                "KMS",            "keys"),
+    # Secrets Manager
+    ("AWSSecretsManager-Secrets","Secrets Manager","secrets"),
+    ("AWSSecretsManagerAPIRequest","Secrets Manager","api"),
+    # CloudTrail
+    ("PaidEventsRecorded",      "CloudTrail",     "paid_events"),
+    ("FreeEventsRecorded",      "CloudTrail",     "free_events"),
+    # Security Hub
+    ("PaidComplianceCheck",     "Security Hub",   "compliance"),
+    ("PaidFindingsIngestion",   "Security Hub",   "findings"),
+    ("OtherProduct:Paid",       "Security Hub",   "findings"),
+    ("SecurityHubProduct",      "Security Hub",   "hub"),
+    # CloudFront
+    ("Executions-CloudFrontFunctions", "CloudFront", "functions"),
+    ("CloudFront-In-Bytes",     "CloudFront",     "ingress"),
+    # Glue
+    ("Catalog-Request",         "Glue",           "catalog_request"),
+    ("Catalog-Storage",         "Glue",           "catalog_storage"),
+    # SQS / SNS
+    ("DeliveryAttempts-SQS",    "SQS",            "deliveries"),
+    ("Event-64K-Chunks",        "SNS",            "events"),
+    # Kiro
+    ("KiroEnterprise",          "Kiro",           "enterprise"),
+    # X-Ray
+    ("XRay-Spans",              "X-Ray",          "spans"),
+]
+
+
+def _categorize_usage_type(col_name: str) -> tuple:
+    """
+    Map a usage type column (e.g. 'APS3-BoxUsage:c6a.2xlarge($)')
+    to (service_category, sub_category, stripped_usage_code).
+    """
+    code = str(col_name).strip()
+    if code.endswith("($)"):
+        code = code[:-3].strip()
+
+    # Strip region prefix like "APS3-", "USE1-", "Global-"
+    m = re.match(r'^[A-Z][A-Z0-9]+\d-', code)
+    if m:
+        code_clean = code[m.end():]
+    elif code.startswith("Global-"):
+        code_clean = code[7:]
+    else:
+        code_clean = code
+
+    for pattern, svc_cat, sub_cat in _USAGE_TYPE_RULES:
+        if pattern in code or pattern in code_clean:
+            return svc_cat, sub_cat, code_clean
+
+    return "Other", "other", code_clean
+
 
 
 # Mapping of verbose AWS product names -> short display names
@@ -174,6 +316,87 @@ def _normalize_cur(df):
     df["usage_type"] = df["lineItem/UsageType"] if "lineItem/UsageType" in df.columns else ""
 
     return df
+
+
+def _is_usage_type_wide(df) -> bool:
+    """
+    Detect the AWS Cost Explorer 'by Usage Type' wide-pivot export.
+    Characteristics:
+      - First column named "Usage type"
+      - Columns contain usage type signatures (BoxUsage, EBS:, DataTransfer, NatGateway)
+    """
+    if df.empty or len(df.columns) < 4:
+        return False
+    if str(df.columns[0]).strip() != "Usage type":
+        return False
+    col_str = " ".join(str(c) for c in df.columns)
+    return any(sig in col_str for sig in ("BoxUsage", "EBS:", "DataTransfer", "NatGateway"))
+
+
+def _normalize_usage_type_wide(df):
+    """
+    Handle the AWS Cost Explorer 'by Usage Type' wide-pivot export.
+
+    Shape coming in:
+        Usage type | APS3-BoxUsage:c6a.2xlarge($) | APS3-EBS:VolumeUsage.gp3($) | ...
+        Usage type total | 163.23 | 65.97 | ...
+        2026-04-01 | | ... | 0.39
+        2026-04-30 | 163.23 | 65.97 | ... | 649.99
+
+    Transformed to normalised long format:
+        date       | service       | usage_type            | cost  | region
+        2026-04-30 | EC2 Compute   | BoxUsage:c6a.2xlarge  | 163.23| global
+        2026-04-30 | EBS Storage   | EBS:VolumeUsage.gp3   | 65.97 | global
+    """
+    df = df.copy()
+    first_col = df.columns[0]
+    df = df.rename(columns={first_col: "date"})
+
+    # Separate the aggregate summary row from actual date rows
+    is_total_row = df["date"].astype(str).str.strip() == "Usage type total"
+    date_rows = df[~is_total_row].copy()
+
+    # Identify data columns (exclude date and "Total costs($)")
+    skip_cols = {"date"}
+    skip_cols.update(
+        c for c in df.columns
+        if str(c).strip().lower() in ("total costs($)", "total cost($)", "total($)")
+    )
+    usage_cols = [c for c in df.columns if c not in skip_cols]
+
+    # Build per-column metadata
+    col_info = {}  # col → (service_category, sub_category, usage_code)
+    for col in usage_cols:
+        svc, sub, code = _categorize_usage_type(col)
+        col_info[col] = (svc, sub, code)
+
+    # Melt wide → long (keep only rows with valid dates and non-zero costs)
+    records = []
+    for _, row in date_rows.iterrows():
+        date_val = str(row["date"]).strip()
+        try:
+            pd.to_datetime(date_val)
+        except Exception:
+            continue
+
+        for col in usage_cols:
+            raw = row.get(col, "")
+            cost = pd.to_numeric(str(raw).strip(), errors="coerce")
+            if pd.isna(cost) or cost <= 0:
+                continue
+            svc_cat, sub_cat, usage_code = col_info[col]
+            records.append({
+                "date":       date_val,
+                "service":    svc_cat,
+                "usage_type": usage_code,
+                "cost":       cost,
+                "region":     "global",
+            })
+
+    if not records:
+        raise ValueError("No valid usage-type records found after parsing.")
+
+    return pd.DataFrame(records)
 
 
 def _is_wide_billing(df) -> bool:
@@ -345,6 +568,9 @@ def parse(file_bytes):
     if "lineItem/UnblendedCost" in df.columns:
         fmt = "CUR"
         df = _normalize_cur(df)
+    elif _is_usage_type_wide(df):
+        fmt = "usage_type"
+        df = _normalize_usage_type_wide(df)
     elif _is_wide_billing(df):
         fmt = "wide"
         df = _normalize_wide(df)
@@ -376,8 +602,8 @@ def parse(file_bytes):
     regions  = sorted(set(r["region"]  for r in records))
 
     # ---- Currency detection ---------------------------------------------
-    if fmt == "wide":
-        currency = "USD"  # wide billing format always uses ($) column names
+    if fmt in ("wide", "usage_type"):
+        currency = "USD"  # wide billing formats always use ($) column names
     elif fmt == "CUR" and "lineItem/CurrencyCode" in df.columns:
         codes = df["lineItem/CurrencyCode"].dropna().unique().tolist()
         currency = str(codes[0]) if codes else "USD"
