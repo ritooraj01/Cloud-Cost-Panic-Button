@@ -176,6 +176,82 @@ def _normalize_cur(df):
     return df
 
 
+def _is_wide_billing(df) -> bool:
+    """
+    Return True when the CSV is the AWS Billing console 'monthly by service'
+    wide-pivot export.  Characteristics:
+      - First column is named "Service"
+      - At least 3 other columns end with "($)"
+    """
+    if df.empty or len(df.columns) < 4:
+        return False
+    if str(df.columns[0]).strip() != "Service":
+        return False
+    dollar_cols = [c for c in df.columns if str(c).strip().endswith("($)")]
+    return len(dollar_cols) >= 3
+
+
+def _normalize_wide(df):
+    """
+    Handle the AWS Billing console 'by service / by month' wide-pivot export.
+
+    Shape coming in:
+        Service  | EC2-Instances($) | S3($) | ... | Total costs($)
+        Service total | 286.82 | 8.11 | ...
+        2025-11-01    |        |      | ...
+        2026-04-01    | 286.82 | 8.11 | ...
+
+    Transformed to normalised long format:
+        date       | service        | cost  | region | usage_type
+        2026-04-01 | EC2-Instances  | 286.82| global |
+        2026-04-01 | S3             | 8.11  | global |
+    """
+    df = df.copy()
+
+    # Rename the first column ("Service") to "date"
+    first_col = df.columns[0]
+    df = df.rename(columns={first_col: "date"})
+
+    # Drop the "Service total" aggregate summary row
+    df = df[df["date"].astype(str).str.strip() != "Service total"].copy()
+
+    # Identify service columns — every column except "date" and "Total costs($)"
+    skip_cols = {"date"}
+    skip_cols.update(
+        c for c in df.columns
+        if str(c).strip().lower() in ("total costs($)", "total cost($)", "total($)")
+    )
+    service_cols = [c for c in df.columns if c not in skip_cols]
+
+    # Build display-name map: "EC2-Instances($)" -> "EC2-Instances"
+    col_to_service = {}
+    for col in service_cols:
+        name = str(col).strip()
+        if name.endswith("($)"):
+            name = name[:-3].strip()
+        col_to_service[col] = name
+
+    # Melt wide → long
+    df = df.melt(
+        id_vars=["date"],
+        value_vars=service_cols,
+        var_name="_svc_col",
+        value_name="cost",
+    )
+    df["service"] = df["_svc_col"].map(col_to_service)
+    df = df.drop(columns=["_svc_col"])
+
+    # Coerce cost; drop rows that are empty or zero (months with no data)
+    df["cost"] = df["cost"].replace("", float("nan"))
+    df["cost"] = pd.to_numeric(df["cost"], errors="coerce")
+    df = df[df["cost"].notna() & (df["cost"] > 0)].copy()
+
+    df["region"] = "global"
+    df["usage_type"] = ""
+
+    return df
+
+
 def _normalize_simple(df):
     """
     Map simplified / manual billing CSV columns to internal names.
@@ -269,6 +345,9 @@ def parse(file_bytes):
     if "lineItem/UnblendedCost" in df.columns:
         fmt = "CUR"
         df = _normalize_cur(df)
+    elif _is_wide_billing(df):
+        fmt = "wide"
+        df = _normalize_wide(df)
     else:
         fmt = "simple"
         df = _normalize_simple(df)   # raises ValueError if required cols missing
